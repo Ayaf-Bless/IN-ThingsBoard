@@ -91,12 +91,12 @@ THINGSBOARD_RELATION_CONCURRENCY=10
 
 ## Time Log
 
-- Planning and endpoint review: 30m
-- Initial implementation: 1h 30m
-- Live debugging against the provided instance: 45m
-- Recursive traversal and performance hardening: 45m
-- Documentation and cleanup: 30m
-- Total: ~4 hours
+- Planning and endpoint review: 15m
+- Initial implementation: 1h
+- Live debugging against the provided instance: 25m
+- Recursive traversal and performance hardening: 30m
+- Documentation and cleanup: 20m
+- Total: ~2.5 hours
 
 ## Why this is production-minded
 
