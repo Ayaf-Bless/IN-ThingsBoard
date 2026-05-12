@@ -1,12 +1,45 @@
 import axios from 'axios';
-import { apiClient } from './api-client';
-import { formatAxiosError } from './api-client';
+import { apiClient, formatAxiosError } from './api-client';
+import { config } from '../config';
 import { Asset, AssetInfo, Customer, PageData, Relation } from '../types/thingsboard';
+import { createLimiter, mapWithConcurrency } from '../utils/async';
 
 const NULL_UUID = '13814000-1dd2-11b2-8080-808080808080';
+type StatusLogger = (message: string) => void;
+
+interface TraversalStats {
+  relationRequests: number;
+  relationCacheHits: number;
+  subtreeCacheHits: number;
+  cachedSubtrees: number;
+}
 
 export class ThingsBoardService {
-  private async getAllPages<T>(path: string, pageSize = 100): Promise<T[]> {
+  private relationsFromCache = new Map<string, Promise<Relation[]>>();
+  private descendantDeviceCache = new Map<string, Promise<string[]>>();
+  private readonly relationRequestLimiter = createLimiter(config.relationConcurrency);
+  private relationRequests = 0;
+  private relationCacheHits = 0;
+  private subtreeCacheHits = 0;
+
+  resetTraversalState(): void {
+    this.relationsFromCache.clear();
+    this.descendantDeviceCache.clear();
+    this.relationRequests = 0;
+    this.relationCacheHits = 0;
+    this.subtreeCacheHits = 0;
+  }
+
+  getTraversalStats(): TraversalStats {
+    return {
+      relationRequests: this.relationRequests,
+      relationCacheHits: this.relationCacheHits,
+      subtreeCacheHits: this.subtreeCacheHits,
+      cachedSubtrees: this.descendantDeviceCache.size,
+    };
+  }
+
+  private async getAllPages<T>(path: string, pageSize = 100, label = 'records', onStatus?: StatusLogger): Promise<T[]> {
     let records: T[] = [];
     let hasNext = true;
     let page = 0;
@@ -17,26 +50,28 @@ export class ThingsBoardService {
       });
       records = records.concat(response.data.data);
       hasNext = response.data.hasNext;
+      onStatus?.(`Loaded ${label} page ${page + 1} with ${response.data.data.length} items (${records.length} total so far).`);
       page++;
     }
 
     return records;
   }
 
-  async getAllAssetInfos(pageSize = 100): Promise<AssetInfo[]> {
+  async getAllAssetInfos(pageSize = 100, onStatus?: StatusLogger): Promise<AssetInfo[]> {
     try {
-      return await this.getAllPages<AssetInfo>('/api/tenant/assetInfos', pageSize);
+      onStatus?.('Trying the metadata-rich /api/tenant/assetInfos endpoint first.');
+      return await this.getAllPages<AssetInfo>('/api/tenant/assetInfos', pageSize, 'asset metadata', onStatus);
     } catch (error) {
       if (!this.shouldFallbackToTenantAssets(error)) {
         throw error;
       }
 
-      console.warn(
-        `AssetInfo endpoint unavailable; falling back to /api/tenant/assets. Reason: ${formatAxiosError(error)}`
+      onStatus?.(
+        `AssetInfo endpoint unavailable. Falling back to /api/tenant/assets and hydrating customer names manually. Reason: ${formatAxiosError(error)}`
       );
 
-      const assets = await this.getAllPages<Asset>('/api/tenant/assets', pageSize);
-      return this.hydrateAssetsWithCustomerTitles(assets);
+      const assets = await this.getAllPages<Asset>('/api/tenant/assets', pageSize, 'assets', onStatus);
+      return this.hydrateAssetsWithCustomerTitles(assets, onStatus);
     }
   }
 
@@ -49,8 +84,8 @@ export class ThingsBoardService {
     return status === 400 || status === 404;
   }
 
-  private async hydrateAssetsWithCustomerTitles(assets: Asset[]): Promise<AssetInfo[]> {
-    const customerTitleMap = await this.getCustomerTitleMap(assets);
+  private async hydrateAssetsWithCustomerTitles(assets: Asset[], onStatus?: StatusLogger): Promise<AssetInfo[]> {
+    const customerTitleMap = await this.getCustomerTitleMap(assets, onStatus);
 
     return assets.map((asset) => ({
       ...asset,
@@ -58,7 +93,7 @@ export class ThingsBoardService {
     }));
   }
 
-  private async getCustomerTitleMap(assets: Asset[]): Promise<Map<string, string>> {
+  private async getCustomerTitleMap(assets: Asset[], onStatus?: StatusLogger): Promise<Map<string, string>> {
     const customerIds = [
       ...new Set(
         assets
@@ -67,26 +102,109 @@ export class ThingsBoardService {
       ),
     ];
 
-    const customers = await Promise.all(
-      customerIds.map(async (customerId) => {
-        try {
-          const response = await apiClient.get<Customer>(`/api/customer/${customerId}`);
-          const title = response.data.title || response.data.name || 'Unknown Customer';
-          return [customerId, title] as const;
-        } catch (error) {
-          console.warn(`Failed to load customer ${customerId}: ${formatAxiosError(error)}`);
-          return [customerId, 'Unknown Customer'] as const;
+    onStatus?.(`Resolving ${customerIds.length} unique customers to rebuild the missing asset metadata.`);
+
+    let resolvedCustomers = 0;
+    const customers = await mapWithConcurrency(customerIds, config.relationConcurrency, async (customerId) => {
+      try {
+        const response = await apiClient.get<Customer>(`/api/customer/${customerId}`);
+        const title = response.data.title || response.data.name || 'Unknown Customer';
+        return [customerId, title] as const;
+      } catch (error) {
+        console.warn(`Failed to load customer ${customerId}: ${formatAxiosError(error)}`);
+        return [customerId, 'Unknown Customer'] as const;
+      } finally {
+        resolvedCustomers++;
+        if (resolvedCustomers === customerIds.length || resolvedCustomers % 25 === 0) {
+          onStatus?.(`Resolved ${resolvedCustomers}/${customerIds.length} customers.`);
         }
-      })
-    );
+      }
+    });
 
     return new Map(customers);
   }
 
-  /**
-   * Fetches relations starting FROM the specified entity.
-   * Typically used to find what an Asset "Contains".
-   */
+  async getDescendantDeviceIds(assetId: string, relationType = 'Contains', visited = new Set<string>()): Promise<string[]> {
+    if (visited.has(assetId)) {
+      return [];
+    }
+
+    const cachedSubtree = this.descendantDeviceCache.get(assetId);
+    if (cachedSubtree) {
+      this.subtreeCacheHits++;
+      return cachedSubtree;
+    }
+
+    const nextVisited = new Set(visited);
+    nextVisited.add(assetId);
+
+    const subtreePromise = this.collectDescendantDeviceIds(assetId, relationType, nextVisited).catch((error) => {
+      this.descendantDeviceCache.delete(assetId);
+      throw error;
+    });
+
+    this.descendantDeviceCache.set(assetId, subtreePromise);
+    return subtreePromise;
+  }
+
+  private async collectDescendantDeviceIds(
+    assetId: string,
+    relationType: string,
+    visited: Set<string>
+  ): Promise<string[]> {
+    const relations = await this.getRelationsFromCached(assetId, 'ASSET');
+    const directDeviceIds = new Set<string>();
+    const childAssetIds = new Set<string>();
+
+    for (const relation of relations) {
+      if (relation.type !== relationType) {
+        continue;
+      }
+
+      if (relation.to.entityType === 'DEVICE') {
+        directDeviceIds.add(relation.to.id);
+        continue;
+      }
+
+      if (relation.to.entityType === 'ASSET' && !visited.has(relation.to.id)) {
+        childAssetIds.add(relation.to.id);
+      }
+    }
+
+    const descendantDeviceLists = await Promise.all(
+      [...childAssetIds].map((childAssetId) => this.getDescendantDeviceIds(childAssetId, relationType, visited))
+    );
+
+    for (const descendantDevices of descendantDeviceLists) {
+      for (const deviceId of descendantDevices) {
+        directDeviceIds.add(deviceId);
+      }
+    }
+
+    return [...directDeviceIds].sort();
+  }
+
+  private async getRelationsFromCached(fromId: string, fromType: string): Promise<Relation[]> {
+    const cacheKey = `${fromType}:${fromId}`;
+    const cachedRelations = this.relationsFromCache.get(cacheKey);
+
+    if (cachedRelations) {
+      this.relationCacheHits++;
+      return cachedRelations;
+    }
+
+    const request = this.relationRequestLimiter(async () => {
+      this.relationRequests++;
+      return this.getRelationsFrom(fromId, fromType);
+    }).catch((error) => {
+      this.relationsFromCache.delete(cacheKey);
+      throw error;
+    });
+
+    this.relationsFromCache.set(cacheKey, request);
+    return request;
+  }
+
   async getRelationsFrom(fromId: string, fromType: string): Promise<Relation[]> {
     const response = await apiClient.get<Relation[]>('/api/relations', {
       params: { fromId, fromType },
@@ -94,9 +212,6 @@ export class ThingsBoardService {
     return response.data;
   }
 
-  /**
-   * Fetches relations pointing TO the specified entity.
-   */
   async getRelationsTo(toId: string, toType: string): Promise<Relation[]> {
     const response = await apiClient.get<Relation[]>('/api/relations', {
       params: { toId, toType },
@@ -110,7 +225,7 @@ export class ThingsBoardService {
         params: { fromId, fromType, relationType, toId, toType },
       });
       return true;
-    } catch (error) {
+    } catch {
       return false;
     }
   }
